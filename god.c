@@ -38,6 +38,7 @@ void usage() {
 	"-r --rundir DIR     switch to DIR before executing the program\n"
 	"-u --user USER      switch to USER before executing the program\n"
 	"-g --group GROUP    switch to GROUP before executing the program\n"
+	"-d --delay-privdrop only switch user after child process has been forked\n"
 	"\nThe program's output go to a blackhole if no logfile is set.\n"
 	"Log files are recycled on SIGHUP.\n"
 	);
@@ -45,6 +46,9 @@ void usage() {
 }
 
 static int nohup = 0;
+static char user[64];
+static char group[64];
+static int delay_privdrop = 0;
 static int logfd[2]; // pipe
 static pid_t childpid = 0;
 static FILE *logfp = NULL;
@@ -54,6 +58,7 @@ static char pidfile[PATH_MAX];
 static char linebuf[1024];
 static pthread_mutex_t logger_mutex;
 
+void drop_priv();
 void daemon_main(int optind, char **argv);
 void signal_init(sigset_t* old_sigmask);
 void *signal_thread(void* arg);
@@ -62,8 +67,6 @@ char *exec_abspath(char *filename);
 
 int main(int argc, char **argv) {
 	char rundir[PATH_MAX];
-	char user[64];
-	char group[64];
 	int foreground = 0;
 
 	memset(logfile, 0, sizeof logfile);
@@ -73,21 +76,22 @@ int main(int argc, char **argv) {
 	memset(group, 0, sizeof group);
 
 	static struct option opts[] = {
-		{ "help",	no_argument,		NULL, 'h' },
-		{ "version",	no_argument,		NULL, 'v' },
-		{ "foreground",	no_argument,		NULL, 'f' },
-		{ "nohup",	no_argument,		NULL, 'n' },
-		{ "logfile",	required_argument,	NULL, 'l' },
-		{ "pidfile",	required_argument,	NULL, 'p' },
-		{ "rundir",	required_argument,	NULL, 'r' },
-		{ "user",	required_argument,	NULL, 'u' },
-		{ "group",	required_argument,	NULL, 'g' },
+		{ "help",		no_argument,		NULL, 'h' },
+		{ "version",		no_argument,		NULL, 'v' },
+		{ "foreground",		no_argument,		NULL, 'f' },
+		{ "nohup",		no_argument,		NULL, 'n' },
+		{ "logfile",		required_argument,	NULL, 'l' },
+		{ "pidfile",		required_argument,	NULL, 'p' },
+		{ "rundir",		required_argument,	NULL, 'r' },
+		{ "user",		required_argument,	NULL, 'u' },
+		{ "group",		required_argument,	NULL, 'g' },
+		{ "delay-privdrop",	no_argument,		NULL, 'd' },
 		{ NULL, 0, NULL, 0 },
 	};
 
 	int ch;
 	while (1) {
-		ch = getopt_long(argc, argv, "l:p:r:u:g:hvfns", opts, NULL);
+		ch = getopt_long(argc, argv, "l:p:r:u:g:hvfnsd", opts, NULL);
 		if (ch == -1)
 			break;
 
@@ -117,6 +121,9 @@ int main(int argc, char **argv) {
 			case 'g':
 				strncpy(group, optarg, sizeof group - 1);
 				break;
+			case 'd':
+				delay_privdrop = 1;
+				break;
 			default:
 				usage();
 		}
@@ -131,33 +138,8 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
-	struct passwd *pwd = NULL;
-	if ((*user && !(pwd = getpwnam(user)))) {
-		fprintf(stderr, "failed to get user %s: %s\n",
-				user, strerror(errno));
-		return 1;
-	}
-
-	struct group *grp = NULL;
-	if ((*group && !(grp = getgrnam(group)))) {
-		fprintf(stderr, "failed to get group %s: %s\n",
-				group, strerror(errno));
-		return 1;
-	}
-
-	if (grp && setregid(grp->gr_gid, grp->gr_gid) == -1) {
-		fprintf(stderr, "failed to switch to group %s: %s\n",
-				group, strerror(errno));
-		return 1;
-	}
-
-	const gid_t gid = getgid();
-	setgroups(1, &gid);
-
-	if (pwd && setreuid(pwd->pw_uid, pwd->pw_uid) == -1) {
-		fprintf(stderr, "failed to switch to user %s: %s\n",
-				user, strerror(errno));
-		return 1;
+	if(!delay_privdrop) {
+		drop_priv();
 	}
 
 	if (*logfile && (logfp = fopen(logfile, "a")) == NULL) {
@@ -209,6 +191,37 @@ int main(int argc, char **argv) {
 	return 0;
 }
 
+void drop_priv() {
+	struct passwd *pwd = NULL;
+	if ((*user && !(pwd = getpwnam(user)))) {
+		fprintf(stderr, "failed to get user %s: %s\n",
+				user, strerror(errno));
+		exit(1);
+	}
+
+	struct group *grp = NULL;
+	if ((*group && !(grp = getgrnam(group)))) {
+		fprintf(stderr, "failed to get group %s: %s\n",
+				group, strerror(errno));
+		exit(1);
+	}
+
+	if (grp && setregid(grp->gr_gid, grp->gr_gid) == -1) {
+		fprintf(stderr, "failed to switch to group %s: %s\n",
+				group, strerror(errno));
+		exit(1);
+	}
+
+	const gid_t gid = getgid();
+	setgroups(1, &gid);
+
+	if (pwd && setreuid(pwd->pw_uid, pwd->pw_uid) == -1) {
+		fprintf(stderr, "failed to switch to user %s: %s\n",
+				user, strerror(errno));
+		exit(1);
+	}
+}
+
 void daemon_main(int optind, char **argv) {
 	if (pidfp) {
 		fprintf(pidfp, "%d\n", getpid());
@@ -234,6 +247,9 @@ void daemon_main(int optind, char **argv) {
 		dup2(logfd[1], 2);
 		if (logfp) {
 			fclose(logfp);
+		}
+		if(delay_privdrop) {
+			drop_priv();
 		}
 		execvp(argv[optind], argv + optind);
 		printf("\x1b%s", strerror(errno));
